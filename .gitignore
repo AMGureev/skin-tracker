@@ -1,0 +1,46 @@
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+**/config.local.json
+**/secrets.json
+*.pem
+*.key
+
+# Private portfolio data and exports
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.csv
+*.xlsx
+*.xls
+exports/
+backups/
+
+# Packaged applications and generated build files
+/build*/
+/dist*/
+*.exe
+*.dll
+*.pkg
+*.zip
+*-smoke*.json
+legacy-smoke*.json
+*.log
+*.log.*
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
