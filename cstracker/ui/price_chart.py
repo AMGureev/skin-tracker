@@ -1,11 +1,37 @@
 """Persistent, square price chart for the legacy item sidebar."""
 
 from datetime import timedelta
+from math import ceil
 import tkinter as tk
 import numpy as np
 import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+def downsample_extrema(rows, *, buckets=60):
+    """Bound chart points while keeping each bucket's endpoints and price extrema."""
+    if len(rows) <= buckets * 10:
+        return rows
+    selected = {0, len(rows) - 1}
+    size = ceil((len(rows) - 2) / buckets)
+    for start in range(1, len(rows) - 1, size):
+        end = min(start + size, len(rows) - 1)
+        selected.update((start, end - 1))
+        for column in range(1, 5):
+            valid = (index for index in range(start, end) if rows[index][column] is not None)
+            try:
+                first = next(valid)
+            except StopIteration:
+                continue
+            low = high = first
+            for index in valid:
+                if rows[index][column] < rows[low][column]:
+                    low = index
+                if rows[index][column] > rows[high][column]:
+                    high = index
+            selected.update((low, high))
+    return [rows[index] for index in sorted(selected)]
 
 
 def dispose_canvas(canvas):
@@ -27,7 +53,6 @@ class ItemPriceChart:
     def __init__(self, parent, colors, font, interactions):
         self.colors = colors
         self.rows = []
-        self._signature = None
         self.range = tk.StringVar(parent, value="30Д")
         controls = tk.Frame(parent, bg=colors["bg_panel"])
         controls.pack(fill=tk.X, pady=(0, 4))
@@ -72,11 +97,9 @@ class ItemPriceChart:
         self.annotation = interactions.attach(self.figure, self.axes, self.series, hover_radius=12)
 
     def set_data(self, rows):
-        signature = tuple(rows)
-        if signature == self._signature:
+        if rows == self.rows:
             return
-        self._signature = signature
-        self.rows = rows
+        self.rows = list(rows)
         self.annotation.set_visible(False)
         self.redraw()
 
@@ -93,18 +116,7 @@ class ItemPriceChart:
             days = {"7Д": 7, "30Д": 30, "90Д": 90, "1Г": 365}[self.range.get()]
             cutoff = rows[-1][0] - timedelta(days=days)
             rows = [row for row in rows if row[0] >= cutoff]
-        # Bound rendering cost while retaining extrema in each time bucket.
-        if len(rows) > 800:
-            indices = {0, len(rows) - 1}
-            for bucket in np.array_split(np.arange(len(rows)), 100):
-                indices.add(int(bucket[0]))
-                indices.add(int(bucket[-1]))
-                for column in range(1, 5):
-                    valid = [int(i) for i in bucket if rows[int(i)][column] is not None]
-                    if valid:
-                        indices.add(min(valid, key=lambda i: rows[i][column]))
-                        indices.add(max(valid, key=lambda i: rows[i][column]))
-            rows = [rows[i] for i in sorted(indices)]
+        rows = downsample_extrema(rows)
         dates = [row[0] for row in rows]
         labels = [date.strftime("%d.%m.%Y %H:%M") for date in dates]
         visible_values = []

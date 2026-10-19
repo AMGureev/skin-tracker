@@ -29,10 +29,15 @@ def _metric_cell(parent, owner, label, value_var, row, column, *, span=1):
 
 def _build_header(inner, owner, *, title_var, subtitle_var, image_attr, box_attr, loading_prefix):
     c = owner._c
+    header = tk.Frame(inner, bg=c["bg_panel"])
+    header.grid(row=0, column=0, sticky="ew")
     tk.Label(
-        inner, text="Позиция" if loading_prefix == "skin" else "Актив",
+        header, text="Позиция" if loading_prefix == "skin" else "Актив",
         bg=c["bg_panel"], fg=c["fg_dim"], font=owner._font_small,
-    ).grid(row=0, column=0, sticky="w")
+    ).pack(side=tk.LEFT)
+    if loading_prefix == "skin":
+        ttk.Button(header, text="График ↗", style="DetailGhost.TButton",
+                   command=owner.open_selected_skin_chart).pack(side=tk.RIGHT)
     tk.Label(
         inner, textvariable=title_var, bg=c["bg_panel"], fg=c["fg"],
         font=("Segoe UI", 13, "bold"), wraplength=290, justify=tk.LEFT,

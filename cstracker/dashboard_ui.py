@@ -4,16 +4,15 @@ import tkinter as tk
 from tkinter import ttk
 
 
-def metric_card(parent, colors, fonts, title, *, width=168):
-    """Карточка KPI: заголовок, значение, подпись."""
+def metric_card(parent, colors, fonts, title):
+    """A compact KPI card that can be placed in a responsive grid."""
     outer = tk.Frame(
         parent, bg=colors["bg_card"], highlightbackground=colors["border_soft"],
         highlightthickness=1,
     )
-    outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 14))
-    accent = tk.Frame(outer, bg=colors["accent_muted"], height=2)
+    accent = tk.Frame(outer, bg=colors["accent_muted"], height=3)
     accent.pack(fill=tk.X)
-    inner = tk.Frame(outer, bg=colors["bg_card"], padx=18, pady=16)
+    inner = tk.Frame(outer, bg=colors["bg_card"], padx=15, pady=6)
     inner.pack(fill=tk.BOTH, expand=True)
 
     body = tk.Frame(inner, bg=colors["bg_card"])
@@ -21,10 +20,10 @@ def metric_card(parent, colors, fonts, title, *, width=168):
     left = tk.Frame(body, bg=colors["bg_card"])
     left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     spark_canvas = tk.Canvas(
-        body, width=116, height=64, bg=colors["bg_card"],
+        body, width=88, height=24, bg=colors["bg_card"],
         highlightthickness=0, bd=0,
     )
-    spark_canvas.pack(side=tk.RIGHT, padx=(12, 0), pady=(8, 0))
+    spark_canvas.pack(side=tk.RIGHT, padx=(8, 0))
 
     title_row = tk.Frame(left, bg=colors["bg_card"])
     title_row.pack(fill=tk.X)
@@ -44,12 +43,12 @@ def metric_card(parent, colors, fonts, title, *, width=168):
         inner, textvariable=value_var, bg=colors["bg_card"], fg=colors["fg"],
         font=fonts["value"], anchor=tk.W,
     )
-    value_lbl.pack(fill=tk.X, pady=(8, 0))
+    value_lbl.pack(fill=tk.X, pady=(3, 0))
     sub_lbl = tk.Label(
         inner, textvariable=sub_var, bg=colors["bg_card"], fg=colors["accent_green"],
         font=fonts["small"], anchor=tk.W,
     )
-    sub_lbl.pack(fill=tk.X, pady=(4, 0))
+    sub_lbl.pack(fill=tk.X, pady=(1, 0))
     return {
         "frame": outer,
         "accent": accent,
@@ -62,16 +61,20 @@ def metric_card(parent, colors, fonts, title, *, width=168):
     }
 
 
-def sidebar_nav_btn(parent, colors, fonts, text, command, *, active=False, badge=None):
+def sidebar_nav_btn(parent, colors, fonts, text, command, *, active=False, badge=None,
+                    reduce_motion=False):
     """Кнопка пункта бокового меню."""
     bg = colors["nav_active"] if active else colors["bg_sidebar"]
     fg = colors["fg"] if active else colors["fg_dim"]
     row = tk.Frame(parent, bg=bg, cursor="hand2")
-    row.pack(fill=tk.X, pady=3)
+    row.pack(fill=tk.X, pady=2)
+
+    indicator = tk.Frame(row, bg=colors["accent"] if active else bg, width=3)
+    indicator.pack(side=tk.LEFT, fill=tk.Y)
 
     lbl = tk.Label(
         row, text=text, bg=bg, fg=fg, font=fonts["nav"],
-        anchor=tk.W, padx=16, pady=10, cursor="hand2",
+        anchor=tk.W, padx=13, pady=10, cursor="hand2",
     )
     lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -86,15 +89,57 @@ def sidebar_nav_btn(parent, colors, fonts, text, command, *, active=False, badge
     def _activate(_e=None):
         command()
 
+    state = {"active": active, "hover": False, "job": None}
+
+    def _blend(first, second, amount):
+        channels = [round(int(first[i:i + 2], 16) * (1 - amount) + int(second[i:i + 2], 16) * amount)
+                    for i in (1, 3, 5)]
+        return "#" + "".join(f"{channel:02X}" for channel in channels)
+
+    def _paint(background, foreground, stripe):
+        row.configure(bg=background)
+        lbl.configure(bg=background, fg=foreground)
+        indicator.configure(bg=stripe)
+
+    def _transition():
+        if state["job"] is not None:
+            row.after_cancel(state["job"])
+            state["job"] = None
+        target_bg = colors["nav_active"] if state["active"] else (
+            colors["bg_elevated"] if state["hover"] else colors["bg_sidebar"]
+        )
+        target_fg = colors["fg"] if state["active"] or state["hover"] else colors["fg_dim"]
+        target_stripe = colors["accent"] if state["active"] else target_bg
+        if reduce_motion or not row.winfo_viewable():
+            _paint(target_bg, target_fg, target_stripe)
+            return
+        start_bg, start_fg, start_stripe = row.cget("bg"), lbl.cget("fg"), indicator.cget("bg")
+
+        def frame(step):
+            amount = 1 - (1 - step / 6) ** 2
+            _paint(_blend(start_bg, target_bg, amount),
+                   _blend(start_fg, target_fg, amount),
+                   _blend(start_stripe, target_stripe, amount))
+            state["job"] = row.after(20, frame, step + 1) if step < 6 else None
+
+        frame(1)
+
+    def set_active(value):
+        state["active"] = bool(value)
+        _transition()
+
+    def stop():
+        if state["job"] is not None:
+            row.after_cancel(state["job"])
+            state["job"] = None
+
     def _hover(_e=None):
-        if row.cget("bg") != colors["nav_active"]:
-            row.configure(bg=colors["bg_elevated"])
-            lbl.configure(bg=colors["bg_elevated"], fg=colors["fg"])
+        state["hover"] = True
+        _transition()
 
     def _leave(_e=None):
-        if row.cget("bg") != colors["nav_active"]:
-            row.configure(bg=colors["bg_sidebar"])
-            lbl.configure(bg=colors["bg_sidebar"], fg=colors["fg_dim"])
+        state["hover"] = False
+        _transition()
 
     for w in (row, lbl):
         w.bind("<Button-1>", _activate)
@@ -104,7 +149,8 @@ def sidebar_nav_btn(parent, colors, fonts, text, command, *, active=False, badge
         badge_lbl.bind("<Button-1>", _activate)
         badge_lbl.bind("<Enter>", _hover)
         badge_lbl.bind("<Leave>", _leave)
-    return {"row": row, "label": lbl, "badge": badge_lbl, "set_active": None}
+    return {"row": row, "label": lbl, "badge": badge_lbl,
+            "set_active": set_active, "stop": stop}
 
 
 def detail_row(parent, colors, fonts, label_var, value_var):

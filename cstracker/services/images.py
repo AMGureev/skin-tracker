@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 
 import requests
 
@@ -42,11 +43,16 @@ def asset_image_url(asset_group, code):
 
 
 class ImageRepository:
-    """Loads images once and safely reuses their bytes across UI requests."""
+    """A byte-bounded LRU for previews shared by background workers."""
 
-    def __init__(self, session=None):
-        self._session = session or requests.Session()
-        self._cache = {}
+    def __init__(self, session=None, *, max_cache_bytes=24 * 1024 * 1024,
+                 max_image_bytes=5 * 1024 * 1024):
+        self._session = session
+        self._local = threading.local()
+        self._cache = OrderedDict()
+        self._cache_bytes = 0
+        self._max_cache_bytes = max_cache_bytes
+        self._max_image_bytes = max_image_bytes
         self._lock = threading.Lock()
 
     def download(self, url, *, timeout=12):
@@ -54,20 +60,52 @@ class ImageRepository:
             return None
         with self._lock:
             cached = self._cache.get(url)
-        if cached:
-            return cached
+            if cached is not None:
+                self._cache.move_to_end(url)
+                return cached
 
-        response = self._session.get(
+        session = self._session
+        if session is None:
+            session = getattr(self._local, "session", None)
+            if session is None:
+                session = self._local.session = requests.Session()
+        response = session.get(
             url,
             timeout=timeout,
             headers={"User-Agent": "SkinTracker/1.0"},
+            stream=True,
         )
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "")
-        if "image" not in content_type.lower() and len(response.content) < 100:
-            return None
-
-        data = response.content
+        try:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if content_type and not content_type.startswith("image/"):
+                return None
+            declared = response.headers.get("Content-Length")
+            if declared:
+                try:
+                    if int(declared) > self._max_image_bytes:
+                        return None
+                except ValueError:
+                    pass
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                size += len(chunk)
+                if size > self._max_image_bytes:
+                    return None
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        finally:
+            response.close()
+        if not data or len(data) > self._max_cache_bytes:
+            return data or None
         with self._lock:
+            old = self._cache.pop(url, None)
+            if old is not None:
+                self._cache_bytes -= len(old)
+            while self._cache and self._cache_bytes + len(data) > self._max_cache_bytes:
+                _, evicted = self._cache.popitem(last=False)
+                self._cache_bytes -= len(evicted)
             self._cache[url] = data
+            self._cache_bytes += len(data)
         return data

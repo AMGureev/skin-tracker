@@ -28,6 +28,12 @@ Inventory history is cached by database revision and date rather than scanned on
 keystroke. Detail charts reuse their figure and canvas and keep extrema when reducing
 long histories for display. The stored history itself is not reduced.
 
+The dashboard palette lives in `cstracker/ui/theme.py`. Search reuses the current
+database revision, and table rows are only moved or rewritten when their display
+data changes. Preview downloads stream into a size-limited LRU cache; the chart
+downsampler retains local minima and maxima with a bounded number of plotted points.
+Navigation and sparkline animation timers stop when the window closes.
+
 ## Data and Build
 
 `skins.db` remains beside the executable. The build does not package or replace it.

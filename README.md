@@ -49,6 +49,12 @@ exports, private configuration, logs and packaged applications are excluded from
 - Interactive charts with tooltips, range controls and wheel zoom.
 - Background network jobs and visible loading indicators.
 
+The Tk dashboard uses a compact card grid, a persistent detail panel with an
+expandable item chart, animated navigation and sparklines. Set
+`SKIN_TRACKER_REDUCED_MOTION=1` before launch to
+disable these animations. Search reuses rows until the database changes, while
+image downloads have a 5 MiB per-image limit and a 24 MiB memory cache.
+
 Price history is collected from available API responses and local snapshots.
 An API connection does not imply that historical Lis Skins prices are available
 for dates before collection started.
@@ -61,6 +67,9 @@ The legacy suite does not require PySide6 or production API keys:
 python -m unittest discover -s tests -p "test_legacy*.py" -v
 python skin_tracker.py --smoke-test --diagnostics-output legacy-smoke-source.json
 ```
+
+Headless resource-bound checks can run separately with
+`python -m unittest tests.test_performance -v`.
 
 The executable smoke test uses a temporary database and simulated delayed
 network responses; it does not open the user's portfolio.

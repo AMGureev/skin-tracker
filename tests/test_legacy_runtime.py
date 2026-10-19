@@ -140,6 +140,17 @@ class LegacyRuntimeTest(unittest.TestCase):
             self.pump(0.08)
             chart.canvas.draw()
 
+    def test_selected_item_chart_opens_once_and_cleans_up(self):
+        skin_id = self.add_skin()
+        with patch.object(self.app, "_lis_lowest_item_info", return_value=None):
+            self.select(skin_id)
+        self.app.open_selected_skin_chart()
+        chart = self.app._popout_chart
+        self.assertIsNotNone(chart)
+        self.app.open_selected_skin_chart()
+        self.assertIs(self.app._popout_chart, chart)
+        self.assertTrue(self.app._popout_window.winfo_exists())
+
     def test_superseded_selection_cannot_replace_current_item(self):
         first = self.add_skin()
         second = self.add_skin("AWP | Graphite (Minimal Wear)")

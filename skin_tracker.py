@@ -21,6 +21,7 @@ import sys
 import webbrowser
 import time
 import logging
+from bisect import bisect_right
 
 from cstracker.background import BackgroundTasks
 from cstracker.services.http import WorkerHttpClient
@@ -61,6 +62,7 @@ from cstracker.ui import (
     build_detail_panel,
     render_preview_image,
 )
+from cstracker.ui.theme import COLORS
 
 MARKET_API_BASE = "https://market.csgo.com/api/v2"
 
@@ -115,17 +117,17 @@ _DEFAULT_VISIBLE_COLUMNS = {
 }
 
 _KPI_ICONS = {
-    "Затраты на инвентарь": "💰",
-    "Текущая стоимость": "📈",
-    "Ожидаемый профит": "📈",
-    "Зафиксировано": "🏦",
-    "Доступно к продаже": "📦",
-    "Ждёт разблокировки": "⏳",
-    "Вложено": "💰",
-    "Текущая оценка": "📈",
-    "Прибыль / убыток": "📈",
-    "Позиций": "📦",
-    "Обновление": "⏱",
+    "Затраты на инвентарь": "◈",
+    "Текущая стоимость": "↗",
+    "Ожидаемый профит": "◇",
+    "Зафиксировано": "✓",
+    "Доступно к продаже": "◎",
+    "Ждёт разблокировки": "◷",
+    "Вложено": "◈",
+    "Текущая оценка": "↗",
+    "Прибыль / убыток": "◇",
+    "Позиций": "◎",
+    "Обновление": "◷",
 }
 
 
@@ -146,11 +148,12 @@ class SkinTracker:
         self.root = root
         self._db_path_override = db_path
         self._closed = False
+        self._reduce_motion = os.environ.get("SKIN_TRACKER_REDUCED_MOTION") == "1"
         self._tasks = BackgroundTasks(root, on_busy=self._show_background_activity)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.title("CS Skin Tracker")
-        self.root.geometry("1780x880")
-        self.root.minsize(1100, 640)
+        self.root.geometry("1600x920")
+        self.root.minsize(1140, 720)
         self._setup_theme()
         self._chart_interactions = ChartInteractionController(self._c)
         self.current_profile = None
@@ -162,6 +165,8 @@ class SkinTracker:
         self._rate_checked_at = 0.0
         self._series_cache = {}
         self._metrics_signature = None
+        self._skin_rows_cache_key = None
+        self._skin_rows_cache = ()
         self.sales_history = {}
         self._images = ImageRepository(session=self._http)
         self._lis = LisSkinsClient(
@@ -175,6 +180,8 @@ class SkinTracker:
         self._tk_image_refs = {}
         self._skin_detail_token = 0
         self._skin_detail_loading_job = None
+        self._popout_chart = None
+        self._popout_window = None
         self._table_sort_state = {
             "skins": {"column": None, "reverse": False},
             "assets": {"column": None, "reverse": False},
@@ -216,6 +223,17 @@ class SkinTracker:
             return
         self._closed = True
         self._tasks.close()
+        for group in (getattr(self, "_sidebar_profile_btns", {}),
+                      getattr(self, "_sidebar_nav_btns", {})):
+            for button in group.values():
+                button["stop"]()
+        for group in (getattr(self, "_skins_kpi_cards", ()),
+                      getattr(self, "_assets_kpi_cards", ())):
+            for card in group:
+                canvas = card.get("spark_canvas")
+                job = getattr(canvas, "_tracker_animation_job", None)
+                if job:
+                    canvas.after_cancel(job)
         for name in ("_background_progress", "_skin_loading_bar", "_asset_loading_bar"):
             bar = getattr(self, name, None)
             if bar is not None:
@@ -224,6 +242,9 @@ class SkinTracker:
             frame = getattr(self, name, None)
             if frame is not None:
                 self._clear_detail_chart(frame)
+        if self._popout_chart is not None:
+            self._popout_chart.close()
+            self._popout_chart = None
         self.conn.close()
         self.root.destroy()
 
@@ -575,7 +596,7 @@ class SkinTracker:
         if self._rate_running:
             return
         age = time.monotonic() - self._rate_checked_at
-        if not force and age < (600 if self._usd_rub_rate_cache else 60):
+        if not force and self._rate_checked_at > 0 and age < (600 if self._usd_rub_rate_cache else 60):
             self._deliver_rate_waiters()
             return
 
@@ -959,31 +980,47 @@ class SkinTracker:
     def _draw_sparkline_canvas(self, canvas, values, *, tone="neutral"):
         if canvas is None:
             return
-        vals = [float(v) for v in (values or []) if v is not None]
-        canvas.delete("all")
-        w = max(int(canvas.winfo_width() or canvas.cget("width")), 40)
-        h = max(int(canvas.winfo_height() or canvas.cget("height")), 24)
+        vals = [float(v) for v in (values or []) if v is not None][-24:]
+        signature = (tuple(vals), tone)
+        if getattr(canvas, "_tracker_signature", None) == signature:
+            return
+        canvas._tracker_signature = signature
+        previous_job = getattr(canvas, "_tracker_animation_job", None)
+        if previous_job:
+            canvas.after_cancel(previous_job)
+            canvas._tracker_animation_job = None
+        w = max(canvas.winfo_width(), int(canvas.cget("width")), 40)
+        h = max(canvas.winfo_height(), int(canvas.cget("height")), 24)
         color = {
             "profit": self._c["profit"],
             "loss": self._c["loss"],
             "warn": self._c["warn_orange"],
             "accent": self._c["accent"],
         }.get(tone, self._c["accent"])
-        grid = self._c["border_soft"]
-        canvas.create_line(0, h - 8, w, h - 8, fill=grid)
-        if len(vals) < 2:
-            canvas.create_line(4, h - 8, w - 4, h - 8, fill=color, width=2)
-            return
-        vals = vals[-24:]
-        lo, hi = min(vals), max(vals)
-        if hi == lo:
-            hi = lo + 1.0
-        points = []
-        for i, value in enumerate(vals):
-            x = 4 + (w - 8) * (i / max(1, len(vals) - 1))
-            y = 6 + (h - 14) * (1.0 - ((value - lo) / (hi - lo)))
-            points.extend((x, y))
-        canvas.create_line(*points, fill=color, width=2.2, smooth=True)
+        lo, hi = (min(vals), max(vals)) if vals else (0.0, 1.0)
+        span = hi - lo or 1.0
+        points = [
+            (4 + (w - 8) * i / max(1, len(vals) - 1),
+             6 + (h - 14) * (1 - (value - lo) / span))
+            for i, value in enumerate(vals)
+        ]
+
+        def draw(step):
+            if self._closed or not canvas.winfo_exists():
+                return
+            canvas.delete("all")
+            canvas.create_line(0, h - 8, w, h - 8, fill=self._c["border_soft"])
+            if len(points) < 2:
+                canvas.create_line(4, h - 8, w - 4, h - 8, fill=color, width=2)
+            else:
+                count = max(2, round(len(points) * step / 7))
+                flat = [coord for point in points[:count] for coord in point]
+                canvas.create_line(*flat, fill=color, width=2.2, smooth=True)
+            canvas._tracker_animation_job = (
+                canvas.after(22, draw, step + 1) if step < 7 else None
+            )
+
+        draw(7 if self._reduce_motion or not canvas.winfo_viewable() else 1)
 
     def _set_kpi_card(self, card, *, icon="", value="—", sub="", tone="neutral", spark=None):
         colors = {
@@ -1462,44 +1499,17 @@ class SkinTracker:
         raise ValueError("Для продажи в USD укажите курс или обе цены за штуку ($ и ₽).")
 
     def _setup_theme(self):
-        self._c = {
-            'bg': '#131A22',
-            'bg_elevated': '#202A36',
-            'bg_sidebar': '#101722',
-            'bg_card': '#1B2430',
-            'bg_panel': '#1B2430',
-            'bg_table': '#202A36',
-            'row_alt': '#1B2430',
-            'fg': '#F2F5F8',
-            'fg_dim': '#9AA6B2',
-            'fg_muted': '#D0D4D9',
-            'accent': '#35d0ba',
-            'accent_muted': '#1F4D52',
-            'accent_green': '#34D399',
-            'profit': '#34D399',
-            'loss': '#EF4444',
-            'nav_active': '#173d45',
-            'success': '#16A34A',
-            'danger': '#EF4444',
-            'info': '#69a9ff',
-            'warn': '#EF4444',
-            'warn_orange': '#e5ae4c',
-            'border': '#2B3644',
-            'border_soft': '#25303D',
-            'entry_bg': '#18212C',
-            'row_hover': '#273544',
-            'selected': '#35D0BA',
-        }
+        self._c = COLORS
         self._font_ui = ("Segoe UI", 10)
         self._font_ui_bold = ("Segoe UI", 10, "bold")
-        self._font_title = ("Segoe UI", 16, "bold")
+        self._font_title = ("Segoe UI", 17, "bold")
         self._font_small = ("Segoe UI", 9)
-        self._font_kpi_value = ("Segoe UI", 18, "bold")
+        self._font_kpi_value = ("Segoe UI", 17, "bold")
         self._font_detail_value = ("Segoe UI", 18, "bold")
         self._font_nav = ("Segoe UI", 10)
         self._font_badge = ("Segoe UI", 8, "bold")
         self._font_spark = ("Segoe UI", 12)
-        self._font_icon = ("Segoe UI Emoji", 18)
+        self._font_icon = ("Segoe UI Symbol", 17)
         self._fonts = {
             'ui': self._font_ui,
             'small': self._font_small,
@@ -1529,12 +1539,12 @@ class SkinTracker:
         btn_pad = {'padding': (12, 8)}
         btn_border = dict(borderwidth=0, relief='flat')
         style.configure(
-            'Accent.TButton', background=c['accent'], foreground='#0d1117',
+            'Accent.TButton', background=c['accent'], foreground=c['bg'],
             focusthickness=1, focuscolor=c['accent'], font=self._font_ui_bold, **btn_pad, **btn_border
         )
         style.map(
             'Accent.TButton',
-            background=[('active', '#5eead4'), ('disabled', c['border']), ('pressed', '#14b8a6')],
+            background=[('active', '#9CF2E3'), ('disabled', c['border']), ('pressed', '#56C5B4')],
             foreground=[('disabled', c['fg_dim'])],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
@@ -1545,7 +1555,7 @@ class SkinTracker:
         )
         style.map(
             'Primary.TButton',
-            background=[('active', c['border']), ('disabled', c['bg_card']), ('pressed', '#30363d')],
+            background=[('active', c['row_hover']), ('disabled', c['bg_card']), ('pressed', c['nav_active'])],
             foreground=[('disabled', c['fg_dim']), ('active', c['fg'])],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
@@ -1556,7 +1566,7 @@ class SkinTracker:
         )
         style.map(
             'Success.TButton',
-            background=[('active', '#3d8c69'), ('disabled', c['border']), ('pressed', '#245c45')],
+            background=[('active', '#32AF83'), ('disabled', c['border']), ('pressed', '#197856')],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
 
@@ -1566,7 +1576,7 @@ class SkinTracker:
         )
         style.map(
             'Danger.TButton',
-            background=[('active', '#e03131'), ('disabled', c['border']), ('pressed', '#8b0f18')],
+            background=[('active', '#E8657E'), ('disabled', c['border']), ('pressed', '#A73C55')],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
 
@@ -1576,7 +1586,7 @@ class SkinTracker:
         )
         style.map(
             'ToolbarMuted.TButton',
-            background=[('active', c['border']), ('disabled', c['bg_card']), ('pressed', '#243040')],
+            background=[('active', c['row_hover']), ('disabled', c['bg_card']), ('pressed', c['nav_active'])],
             foreground=[('disabled', c['fg_dim']), ('active', c['fg'])],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
@@ -1587,14 +1597,14 @@ class SkinTracker:
         )
         style.map(
             'Ghost.TButton',
-            background=[('active', c['bg_elevated']), ('disabled', c['bg_card']), ('pressed', c['bg_table'])],
+            background=[('active', c['bg_elevated']), ('disabled', c['bg_card']), ('pressed', c['nav_active'])],
             foreground=[('disabled', c['fg_dim']), ('active', c['fg'])],
             relief=[('pressed', 'flat'), ('!pressed', 'flat')],
         )
 
         detail_btn_pad = {'padding': (6, 4)}
         for detail_style, background, foreground in (
-            ('DetailSuccess.TButton', c['success'], '#f4f9f6'),
+            ('DetailSuccess.TButton', c['success'], c['fg']),
             ('DetailPrimary.TButton', c['bg_elevated'], c['fg']),
             ('DetailGhost.TButton', c['entry_bg'], c['fg_muted']),
         ):
@@ -1607,8 +1617,8 @@ class SkinTracker:
                 relief='flat',
                 **detail_btn_pad,
             )
-        style.map('DetailSuccess.TButton', background=[('active', '#3d8c69'), ('pressed', '#245c45')])
-        style.map('DetailPrimary.TButton', background=[('active', c['border']), ('pressed', '#30363d')])
+        style.map('DetailSuccess.TButton', background=[('active', '#32AF83'), ('pressed', '#197856')])
+        style.map('DetailPrimary.TButton', background=[('active', c['row_hover']), ('pressed', c['nav_active'])])
         style.map('DetailGhost.TButton', background=[('active', c['bg_elevated']), ('pressed', c['bg_table'])])
 
         style.configure('Treeview',
@@ -1789,29 +1799,26 @@ class SkinTracker:
     def _highlight_sidebar_profile(self, profile):
         for key, btn in getattr(self, "_sidebar_profile_btns", {}).items():
             active = key == profile
-            bg = self._c["nav_active"] if active else self._c["bg_sidebar"]
-            fg = self._c["fg"] if active else self._c["fg_dim"]
-            btn["row"].configure(bg=bg)
-            btn["label"].configure(bg=bg, fg=fg)
+            btn["set_active"](active)
             if btn.get("badge"):
                 btn["badge"].configure(bg=self._c["accent"] if active else self._c["bg_elevated"])
 
     def _highlight_sidebar_nav(self, nav_key):
         self._active_nav = nav_key
         for key, btn in getattr(self, "_sidebar_nav_btns", {}).items():
-            active = key == nav_key
-            bg = self._c["nav_active"] if active else self._c["bg_sidebar"]
-            fg = self._c["fg"] if active else self._c["fg_dim"]
-            btn["row"].configure(bg=bg)
-            btn["label"].configure(bg=bg, fg=fg)
+            btn["set_active"](key == nav_key)
 
     def _update_topbar_for_profile(self, profile):
         if profile == "skins":
+            self._page_title.configure(text="Портфель скинов")
+            self._page_subtitle.configure(text="Позиции, рынок и результат в одном месте")
             self._top_add_btn.configure(text="  +  Добавить", command=self.open_add_window)
             self._top_refresh_btn.configure(command=self.refresh_all)
             self._global_search_entry.configure(textvariable=self.name_search_var)
             self._search_placeholder = "Поиск по названию скина..."
         else:
+            self._page_title.configure(text="Другие активы")
+            self._page_subtitle.configure(text="Курсы, оценка и динамика портфеля")
             self._top_add_btn.configure(text="  +  Добавить актив", command=self.open_add_asset_window)
             self._top_refresh_btn.configure(command=self._refresh_assets_all)
             self._global_search_entry.configure(textvariable=self.asset_name_search_var)
@@ -1993,7 +2000,7 @@ class SkinTracker:
         )
         grouped = defaultdict(float)
         counts = defaultdict(int)
-        for captured_at, skin_id, qty, price_net in cursor.fetchall():
+        for captured_at, skin_id, qty, price_net in cursor:
             try:
                 sid = int(skin_id)
                 qty_i = int(qty or 0)
@@ -2022,10 +2029,10 @@ class SkinTracker:
             return None
         current_dt, current_value = series[-1]
         target = current_dt - timedelta(days=days)
-        candidates = [point for point in series if point[0] <= target]
-        if not candidates:
+        index = bisect_right(series, (target, float("inf"))) - 1
+        if index < 0:
             return None
-        previous_dt, previous_value = candidates[-1]
+        previous_dt, previous_value = series[index]
         if previous_value <= 0:
             return None
         delta = current_value - previous_value
@@ -2044,38 +2051,25 @@ class SkinTracker:
             return
         cursor = self.conn.cursor()
         now_iso = datetime.now().strftime("%Y-%m-%d")
-        cursor.execute("SELECT COALESCE(SUM(total_buy_price), 0) FROM skins WHERE sell_date IS NULL")
-        invested = float(cursor.fetchone()[0] or 0)
-
-        cursor.execute(
-            "SELECT COUNT(*) FROM skins WHERE sell_date IS NULL AND unlock_date > ?",
-            (now_iso,),
-        )
-        locked_count = int(cursor.fetchone()[0] or 0)
-        cursor.execute(
-            "SELECT MIN(unlock_date) FROM skins WHERE sell_date IS NULL AND unlock_date > ?",
-            (now_iso,),
-        )
-        locked_nearest = cursor.fetchone()[0]
-
-        cursor.execute(
-            "SELECT COUNT(*) FROM skins WHERE sell_date IS NULL AND unlock_date <= ?",
-            (now_iso,),
-        )
-        avail_count = int(cursor.fetchone()[0] or 0)
-
-        cursor.execute("SELECT name, quantity FROM skins WHERE sell_date IS NULL")
-        all_rows = cursor.fetchall()
-        cursor.execute(
-            "SELECT name, quantity FROM skins WHERE sell_date IS NULL AND unlock_date <= ?",
-            (now_iso,),
-        )
-        avail_rows = cursor.fetchall()
-        cursor.execute(
-            "SELECT name, quantity FROM skins WHERE sell_date IS NULL AND unlock_date > ?",
-            (now_iso,),
-        )
-        locked_rows = cursor.fetchall()
+        invested = avail_cost = locked_cost = 0.0
+        locked_nearest = None
+        all_rows, avail_rows, locked_rows = [], [], []
+        for name, quantity, cost, unlock_date in cursor.execute(
+            "SELECT name, quantity, total_buy_price, unlock_date FROM skins WHERE sell_date IS NULL"
+        ):
+            invested += float(cost or 0)
+            pair = (name, quantity)
+            all_rows.append(pair)
+            if unlock_date and unlock_date > now_iso:
+                locked_cost += float(cost or 0)
+                locked_rows.append(pair)
+                if locked_nearest is None or unlock_date < locked_nearest:
+                    locked_nearest = unlock_date
+            else:
+                avail_cost += float(cost or 0)
+                avail_rows.append(pair)
+        locked_count = len(locked_rows)
+        avail_count = len(avail_rows)
 
         sell_prices = getattr(self, "sell_order_prices", None) or {}
         buy_prices = getattr(self, "buy_order_prices", None) or {}
@@ -2131,10 +2125,11 @@ class SkinTracker:
             """
             SELECT inventory_sell_gross_rub, inventory_buy_cost_rub
             FROM inventory_value_history
-            ORDER BY captured_at ASC
+            ORDER BY captured_at DESC
+            LIMIT 24
             """
         )
-        history_rows = cursor.fetchall()
+        history_rows = cursor.fetchall()[::-1]
         spark_sell = [float(r[0] or 0) * (1.0 - MARKET_COMMISSION_RATE) for r in history_rows]
         spark_cost = [float(r[1] or 0) for r in history_rows]
         stable_sell_series = self._available_inventory_series("sell_order_net_rub")
@@ -2156,7 +2151,7 @@ class SkinTracker:
 
         self._set_kpi_card(
             cards[0],
-            icon="💰",
+            icon="◈",
             value=self._fmt_rub_kpi(invested),
             sub=invested_usd_sub,
             tone="neutral",
@@ -2164,7 +2159,7 @@ class SkinTracker:
         )
         self._set_kpi_card(
             cards[1],
-            icon="📈",
+            icon="↗",
             value=f"Sell {self._fmt_rub_kpi(sell_value)}",
             sub=f"Buy {self._fmt_rub_kpi(buy_value) if buy_value > 0 else '—'} · {_dual_usd_line(sell_value, buy_value)}",
             tone="profit" if (stable_week_sell or {"delta": sell_pct})["delta"] >= 0 else "loss",
@@ -2174,7 +2169,7 @@ class SkinTracker:
         buy_profit_txt = f"{buy_profit:+,.0f} ₽".replace(",", " ") if buy_value > 0 else "—"
         self._set_kpi_card(
             cards[2],
-            icon="📈",
+            icon="↗",
             value=f"Sell {sell_profit:+,.0f} ₽".replace(",", " "),
             sub=f"Buy {buy_profit_txt} · {_dual_usd_line(sell_profit, buy_profit if buy_value > 0 else None, signed=True)}",
             tone="profit" if sell_profit >= 0 else "loss",
@@ -2220,7 +2215,7 @@ class SkinTracker:
             realized_sub = "нет курса продаж" if realized_missing_rate else self._fmt_usd_kpi(0, signed=True)
         self._set_kpi_card(
             cards[3],
-            icon="🏦",
+            icon="✓",
             value=f"{realized_profit:+,.0f} ₽".replace(",", " "),
             sub=realized_sub,
             tone="profit" if realized_profit >= 0 else "loss",
@@ -2230,29 +2225,19 @@ class SkinTracker:
         avail_sub = f"{avail_count} поз."
         avail_value = f"Sell {self._fmt_rub_kpi(avail_sell)}" if avail_sell > 0 else f"Buy {self._fmt_rub_kpi(avail_buy)}" if avail_buy > 0 else "—"
         if avail_sell <= 0 and avail_buy <= 0:
-            cursor.execute(
-                "SELECT COALESCE(SUM(total_buy_price), 0) FROM skins WHERE sell_date IS NULL AND unlock_date <= ?",
-                (now_iso,),
-            )
-            fallback = float(cursor.fetchone()[0] or 0)
-            avail_value = self._fmt_rub_kpi(fallback)
+            avail_value = self._fmt_rub_kpi(avail_cost)
             avail_sub = f"{avail_count} поз. · нет цен маркета"
         else:
             avail_sub = (
                 f"Buy {self._fmt_rub_kpi(avail_buy) if avail_buy > 0 else '—'} · "
                 f"{_dual_usd_line(avail_sell, avail_buy)} · {avail_count} поз."
             )
-        self._set_kpi_card(cards[4], icon="📦", value=avail_value, sub=avail_sub, tone="neutral")
+        self._set_kpi_card(cards[4], icon="◎", value=avail_value, sub=avail_sub, tone="neutral")
 
         locked_sub = self._fmt_short_unlock_date(locked_nearest) if locked_nearest else f"{locked_count} поз."
         locked_value = self._fmt_rub_kpi(locked_sell) if locked_sell > 0 else self._fmt_rub_kpi(locked_buy) if locked_buy > 0 else "—"
         if locked_sell <= 0 and locked_buy <= 0:
-            cursor.execute(
-                "SELECT COALESCE(SUM(total_buy_price), 0) FROM skins WHERE sell_date IS NULL AND unlock_date > ?",
-                (now_iso,),
-            )
-            fallback = float(cursor.fetchone()[0] or 0)
-            locked_value = self._fmt_rub_kpi(fallback)
+            locked_value = self._fmt_rub_kpi(locked_cost)
             locked_sub = (
                 f"{self._fmt_short_unlock_date(locked_nearest)} · нет цен маркета"
                 if locked_nearest
@@ -2260,11 +2245,10 @@ class SkinTracker:
             )
         elif locked_nearest:
             locked_sub = f"{locked_sub} · {locked_count} поз."
-        self._set_kpi_card(cards[5], icon="⏳", value=locked_value, sub=locked_sub, tone="warn")
+        self._set_kpi_card(cards[5], icon="◷", value=locked_value, sub=locked_sub, tone="warn")
 
         if hasattr(self, "_positions_badge_var"):
-            cursor.execute("SELECT COUNT(*) FROM skins WHERE sell_date IS NULL")
-            self._positions_badge_var.set(str(cursor.fetchone()[0] or 0))
+            self._positions_badge_var.set(str(len(all_rows)))
 
         insights = getattr(self, "_skins_insight_cards", None)
         if insights:
@@ -2316,13 +2300,13 @@ class SkinTracker:
         pnl = total_current_rub - total_buy_rub
         pct = (pnl / total_buy_rub * 100.0) if total_buy_rub > 0 else 0.0
         cards = self._assets_kpi_cards
-        self._set_kpi_card(cards[0], icon="💰", value=f"{total_buy_rub:,.0f} ₽".replace(",", " "), sub=f"{total_buy_usd:,.2f} $".replace(",", " "), tone="neutral")
-        self._set_kpi_card(cards[1], icon="📈", value=f"{total_current_rub:,.0f} ₽".replace(",", " "), sub=f"{total_current_usd:,.2f} $".replace(",", " "), tone="profit" if pct >= 0 else "loss")
-        self._set_kpi_card(cards[2], icon="📈", value=f"{pnl:+,.0f} ₽".replace(",", " "), sub=f"{pct:+.2f}%", tone="profit" if pnl >= 0 else "loss")
+        self._set_kpi_card(cards[0], icon="◈", value=f"{total_buy_rub:,.0f} ₽".replace(",", " "), sub=f"{total_buy_usd:,.2f} $".replace(",", " "), tone="neutral")
+        self._set_kpi_card(cards[1], icon="↗", value=f"{total_current_rub:,.0f} ₽".replace(",", " "), sub=f"{total_current_usd:,.2f} $".replace(",", " "), tone="profit" if pct >= 0 else "loss")
+        self._set_kpi_card(cards[2], icon="↗", value=f"{pnl:+,.0f} ₽".replace(",", " "), sub=f"{pct:+.2f}%", tone="profit" if pnl >= 0 else "loss")
         cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM assets")
-        self._set_kpi_card(cards[3], icon="📦", value=str(cursor.fetchone()[0] or 0), sub="всего позиций", tone="neutral")
-        self._set_kpi_card(cards[4], icon="⏱", value="—", sub="после обновления", tone="neutral")
+        self._set_kpi_card(cards[3], icon="◎", value=str(cursor.fetchone()[0] or 0), sub="всего позиций", tone="neutral")
+        self._set_kpi_card(cards[4], icon="◷", value="—", sub="после обновления", tone="neutral")
         insights = getattr(self, "_assets_insight_cards", None)
         if insights:
             self._set_insight(insights, "today", "—", tone="neutral")
@@ -2688,7 +2672,7 @@ class SkinTracker:
         )
         self.conn.commit()
 
-    def _draw_skin_detail_chart(self, skin_name, *, skin_id=None):
+    def _skin_chart_rows(self, skin_name, skin_id):
         rows = self._item_price_history_rows(skin_name, skin_id)
         history = self.sales_history.get(skin_name, [])
         if not rows and history:
@@ -2696,6 +2680,10 @@ class SkinTracker:
                 (datetime.fromtimestamp(float(ts) / (1000.0 if float(ts) > 100_000_000_000 else 1.0)), float(price), None, None, None)
                 for ts, price in sorted(history, key=lambda point: point[0])
             ]
+        return rows
+
+    def _draw_skin_detail_chart(self, skin_name, *, skin_id=None):
+        rows = self._skin_chart_rows(skin_name, skin_id)
         chart = getattr(self, "_skin_price_chart", None)
         if chart is None:
             for widget in self._skin_chart_frame.winfo_children():
@@ -2704,76 +2692,134 @@ class SkinTracker:
             self._skin_price_chart = chart
         chart.set_data(rows)
 
+    def open_selected_skin_chart(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        values = self.tree.item(selected[0], "values")
+        skin_id = int(values[0])
+        skin_name = self._selected_skin_original_name(values)
+        rows = self._skin_chart_rows(skin_name, skin_id)
+        if self._popout_window is not None and self._popout_window.winfo_exists():
+            self._popout_window.title(f"История цены · {skin_name}")
+            self._popout_chart.set_data(rows)
+            self._popout_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self._style_toplevel(window)
+        window.title(f"История цены · {skin_name}")
+        window.geometry("640x610")
+        window.minsize(460, 460)
+        chart = ItemPriceChart(window, self._c, self._font_small, self._chart_interactions)
+        chart.canvas.get_tk_widget().configure(width=580, height=470)
+        chart.set_data(rows)
+        self._popout_window, self._popout_chart = window, chart
+
+        def close_chart():
+            chart.close()
+            self._popout_chart = self._popout_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_chart)
+
     def _build_app_shell(self):
         shell = tk.Frame(self.root, bg=self._c["bg"])
         shell.pack(fill=tk.BOTH, expand=True)
-        self._sidebar = tk.Frame(shell, bg=self._c["bg_sidebar"], width=210)
+        self._sidebar = tk.Frame(shell, bg=self._c["bg_sidebar"], width=220)
         self._sidebar.pack(side=tk.LEFT, fill=tk.Y)
         self._sidebar.pack_propagate(False)
         self._main_col = ttk.Frame(shell, style="App.TFrame")
         self._main_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._build_sidebar()
         self._build_topbar(self._main_col)
-        self._content_stack = ttk.Frame(self._main_col, style="App.TFrame", padding=(14, 0, 14, 12))
+        self._content_stack = ttk.Frame(self._main_col, style="App.TFrame", padding=(20, 0, 20, 16))
         self._content_stack.pack(fill=tk.BOTH, expand=True)
 
     def _build_sidebar(self):
         c, f = self._c, self._fonts
-        logo = tk.Frame(self._sidebar, bg=c["bg_sidebar"], pady=16, padx=14)
+        logo = tk.Frame(self._sidebar, bg=c["bg_sidebar"], pady=22, padx=18)
         logo.pack(fill=tk.X)
-        tk.Label(logo, text="CS", bg=c["accent"], fg="#0d1117", font=("Segoe UI", 11, "bold"), padx=6, pady=2).pack(side=tk.LEFT)
-        tk.Label(logo, text="Skin Tracker", bg=c["bg_sidebar"], fg=c["fg"], font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(logo, text="ST", bg=c["accent"], fg=c["bg"], font=("Segoe UI", 13, "bold"), padx=9, pady=5).pack(side=tk.LEFT)
+        brand = tk.Frame(logo, bg=c["bg_sidebar"])
+        brand.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(brand, text="SKIN TRACKER", bg=c["bg_sidebar"], fg=c["fg"], font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        tk.Label(brand, text="PORTFOLIO DESK", bg=c["bg_sidebar"], fg=c["fg_dim"], font=("Segoe UI", 8)).pack(anchor=tk.W)
 
         nav_box = tk.Frame(self._sidebar, bg=c["bg_sidebar"])
-        nav_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=(8, 0))
+        nav_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        tk.Label(nav_box, text="РАБОЧАЯ ОБЛАСТЬ", bg=c["bg_sidebar"], fg=c["fg_dim"],
+                 font=("Segoe UI", 8, "bold"), anchor=tk.W).pack(fill=tk.X, padx=12, pady=(0, 8))
         self._sidebar_profile_btns = {}
         self._sidebar_profile_btns["skins"] = sidebar_nav_btn(
-            nav_box, c, f, "📦  Скины", lambda: self.switch_profile("skins"), active=True,
+            nav_box, c, f, "◈   Скины", lambda: self.switch_profile("skins"), active=True,
+            reduce_motion=self._reduce_motion,
         )
         self._sidebar_profile_btns["assets"] = sidebar_nav_btn(
-            nav_box, c, f, "💰  Активы", lambda: self.switch_profile("assets"),
+            nav_box, c, f, "◇   Активы", lambda: self.switch_profile("assets"),
+            reduce_motion=self._reduce_motion,
         )
-        tk.Frame(nav_box, bg=c["border"], height=1).pack(fill=tk.X, pady=10, padx=8)
+        tk.Frame(nav_box, bg=c["border"], height=1).pack(fill=tk.X, pady=15, padx=8)
+        tk.Label(nav_box, text="АНАЛИТИКА", bg=c["bg_sidebar"], fg=c["fg_dim"],
+                 font=("Segoe UI", 8, "bold"), anchor=tk.W).pack(fill=tk.X, padx=12, pady=(0, 8))
 
         self._sidebar_nav_btns = {}
         self._positions_badge_var = tk.StringVar(value="0")
         self._sidebar_nav_btns["overview"] = sidebar_nav_btn(
-            nav_box, c, f, "📊  Обзор",
+            nav_box, c, f, "▣   Обзор",
             lambda: self._sidebar_nav_skins("overview"), active=True,
+            reduce_motion=self._reduce_motion,
         )
         self._sidebar_nav_btns["positions"] = sidebar_nav_btn(
-            nav_box, c, f, "📦  Позиции",
+            nav_box, c, f, "≡   Позиции",
             lambda: self._sidebar_nav_skins("overview"),
             badge=self._positions_badge_var.get(),
+            reduce_motion=self._reduce_motion,
         )
         if self._sidebar_nav_btns["positions"].get("badge"):
             self._sidebar_nav_btns["positions"]["badge"].configure(textvariable=self._positions_badge_var)
         self._sidebar_nav_btns["sales"] = sidebar_nav_btn(
-            nav_box, c, f, "📈  Продажи", lambda: self._sidebar_nav_skins("sales"),
+            nav_box, c, f, "↗   Продажи", lambda: self._sidebar_nav_skins("sales"),
+            reduce_motion=self._reduce_motion,
         )
         self._sidebar_nav_btns["charts"] = sidebar_nav_btn(
-            nav_box, c, f, "📉  Графики", lambda: self._sidebar_nav_skins("charts"),
+            nav_box, c, f, "⌁   Графики", lambda: self._sidebar_nav_skins("charts"),
+            reduce_motion=self._reduce_motion,
         )
         self._sidebar_nav_btns["settings"] = sidebar_nav_btn(
-            nav_box, c, f, "⚙  Настройки", lambda: self.open_settings(),
+            nav_box, c, f, "⚙   Настройки", lambda: self.open_settings(),
+            reduce_motion=self._reduce_motion,
         )
 
-        foot = tk.Frame(self._sidebar, bg=c["bg_sidebar"], padx=14, pady=12)
-        foot.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Label(foot, text="Курс $", bg=c["bg_sidebar"], fg=c["fg_dim"], font=f["small"]).pack(anchor=tk.W)
+        foot = tk.Frame(self._sidebar, bg=c["bg_card"], padx=16, pady=14,
+                        highlightbackground=c["border_soft"], highlightthickness=1)
+        foot.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=16)
+        tk.Label(foot, text="КУРС USD / RUB", bg=c["bg_card"], fg=c["fg_dim"], font=f["small"]).pack(anchor=tk.W)
         self._rate_label_var = tk.StringVar(value="—")
-        tk.Label(foot, textvariable=self._rate_label_var, bg=c["bg_sidebar"], fg=c["fg"], font=f["value"]).pack(anchor=tk.W)
+        tk.Label(foot, textvariable=self._rate_label_var, bg=c["bg_card"], fg=c["fg"], font=f["value"]).pack(anchor=tk.W, pady=(6, 0))
         self._sync_label_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self._sync_label_var, bg=c["bg_sidebar"], fg=c["fg_dim"], font=f["small"], wraplength=170).pack(anchor=tk.W, pady=(8, 0))
+        tk.Label(foot, textvariable=self._sync_label_var, bg=c["bg_card"], fg=c["fg_dim"], font=f["small"], wraplength=175).pack(anchor=tk.W, pady=(8, 0))
         self._refresh_usd_rate_footer()
 
     def _build_topbar(self, parent):
-        bar = tk.Frame(parent, bg=self._c["bg"], padx=20, pady=16)
+        bar = tk.Frame(parent, bg=self._c["bg"], padx=22, pady=18)
         bar.pack(fill=tk.X)
-        self._background_progress = ttk.Progressbar(bar, mode="indeterminate", length=65)
-        search_wrap = tk.Frame(bar, bg=self._c["entry_bg"], highlightbackground=self._c["border_soft"], highlightthickness=1)
+        heading = tk.Frame(bar, bg=self._c["bg"])
+        heading.pack(fill=tk.X, pady=(0, 14))
+        tk.Label(heading, text="ВАШ ПОРТФЕЛЬ  /  ОБЗОР", bg=self._c["bg"],
+                 fg=self._c["accent"], font=("Segoe UI", 8, "bold")).pack(anchor=tk.W)
+        self._page_title = tk.Label(heading, text="Портфель скинов", bg=self._c["bg"],
+                                    fg=self._c["fg"], font=("Segoe UI", 23, "bold"))
+        self._page_title.pack(anchor=tk.W, pady=(2, 0))
+        self._page_subtitle = tk.Label(heading, text="Позиции, рынок и результат в одном месте",
+                                       bg=self._c["bg"], fg=self._c["fg_dim"], font=self._font_ui)
+        self._page_subtitle.pack(anchor=tk.W, pady=(2, 0))
+        actions = tk.Frame(bar, bg=self._c["bg"])
+        actions.pack(fill=tk.X)
+        self._background_progress = ttk.Progressbar(actions, mode="indeterminate", length=65)
+        search_wrap = tk.Frame(actions, bg=self._c["entry_bg"], highlightbackground=self._c["border_soft"], highlightthickness=1)
         search_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-        tk.Label(search_wrap, text="🔍", bg=self._c["entry_bg"], fg=self._c["fg_dim"]).pack(side=tk.LEFT, padx=(10, 4))
+        tk.Label(search_wrap, text="⌕", bg=self._c["entry_bg"], fg=self._c["accent"],
+                 font=("Segoe UI Symbol", 15)).pack(side=tk.LEFT, padx=(12, 6))
         self.name_search_var = tk.StringVar()
         self.asset_name_search_var = tk.StringVar()
         self.asset_name_search_var.trace_add("write", lambda *_: self._tasks.debounce("asset-search", 180, self.load_assets_data))
@@ -2785,9 +2831,9 @@ class SkinTracker:
         self._global_search_entry.bind("<FocusOut>", self._apply_search_placeholder)
         self.root.after_idle(self._apply_search_placeholder)
         tk.Label(search_wrap, text="Ctrl+K", bg=self._c["entry_bg"], fg=self._c["fg_dim"], font=self._font_small).pack(side=tk.RIGHT, padx=10)
-        self._top_add_btn = ttk.Button(bar, text="  +  Добавить", style="Accent.TButton", command=self.open_add_window)
+        self._top_add_btn = ttk.Button(actions, text="  +  Добавить", style="Accent.TButton", command=self.open_add_window)
         self._top_add_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        self._top_refresh_btn = ttk.Button(bar, text="Обновить", style="Primary.TButton", command=self.refresh_all)
+        self._top_refresh_btn = ttk.Button(actions, text="Обновить", style="Primary.TButton", command=self.refresh_all)
         self._top_refresh_btn.pack(side=tk.RIGHT, padx=(6, 0))
         self._skins_market_menu = tk.Menu(self.root, **self._skins_dropdown_menu_kw())
         self._skins_market_menu.add_command(label="Цены с маркета", command=self.update_market_prices)
@@ -2796,7 +2842,7 @@ class SkinTracker:
         self._skins_market_menu.add_command(label="Витрина: цена", command=self.open_cs_market_set_price_window)
         self._skins_market_menu.add_command(label="Витрина: снять", command=self.open_cs_market_remove_window)
         self._top_market_btn = ttk.Button(
-            bar, text="Маркет ▾", style="Primary.TButton", command=self._skins_popup_market_menu,
+            actions, text="Маркет ▾", style="Primary.TButton", command=self._skins_popup_market_menu,
         )
         self._top_market_btn.pack(side=tk.RIGHT, padx=(6, 0))
         self.market_button = self._top_market_btn
@@ -2805,10 +2851,15 @@ class SkinTracker:
 
     def _build_kpi_row(self, parent, titles, attr_name):
         row = tk.Frame(parent, bg=self._c["bg"])
-        row.pack(fill=tk.X, pady=(0, 18), padx=(2, 0))
+        row.pack(fill=tk.X, pady=(0, 8))
+        columns = 3 if len(titles) > 3 else len(titles)
+        for column in range(columns):
+            row.grid_columnconfigure(column, weight=1, uniform="metric")
         cards = []
-        for title in titles:
+        for index, title in enumerate(titles):
             card = metric_card(row, self._c, self._fonts, title)
+            card["frame"].grid(row=index // columns, column=index % columns,
+                               sticky="nsew", padx=(0, 10), pady=(0, 6))
             card["icon"].set(_KPI_ICONS.get(title, ""))
             cards.append(card)
         setattr(self, attr_name, cards)
@@ -2816,7 +2867,7 @@ class SkinTracker:
 
     def _build_insight_row(self, parent, attr_name):
         row = tk.Frame(parent, bg=self._c["bg"])
-        row.pack(fill=tk.X, pady=(0, 18))
+        row.pack(fill=tk.X, pady=(0, 14))
         cards = {}
         for key, title in (
             ("today", "Сегодня"),
@@ -2862,9 +2913,9 @@ class SkinTracker:
         self._build_insight_row(main, "_assets_insight_cards")
         body = tk.Frame(main, bg=self._c["bg"])
         body.pack(fill=tk.BOTH, expand=True)
+        self._build_detail_panel(body, mode="assets")
         left = tk.Frame(body, bg=self._c["bg"])
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-        self._build_detail_panel(body, mode="assets")
 
         hdr = tk.Frame(left, bg=self._c["bg"])
         hdr.pack(fill=tk.X, pady=(0, 6))
@@ -2966,6 +3017,7 @@ class SkinTracker:
         total_buy_usd = 0.0
         needle = self._search_text(getattr(self, "asset_name_search_var", tk.StringVar())).lower()
         visible_index = 0
+        previous_iid = None
         for row in rows:
             group_name = row[1]
             if group_filter == "Металлы" and group_name != "METAL":
@@ -3009,8 +3061,9 @@ class SkinTracker:
                     self._format_growth_pct(cur_rub, buy_rub),
                     self._format_target_progress(row[10], cur_rub),
                     row[11] or "-",
-                ), tags=(stripe_tag, result_tag)
+                ), tags=(stripe_tag, result_tag), previous_iid=previous_iid
             )
+            previous_iid = iid
             visible_index += 1
         removed = previous - visible
         if removed:
@@ -3432,9 +3485,9 @@ class SkinTracker:
         self._build_insight_row(main, "_skins_insight_cards")
         body = tk.Frame(main, bg=self._c["bg"])
         body.pack(fill=tk.BOTH, expand=True)
+        self._build_detail_panel(body, mode="skins")
         left = tk.Frame(body, bg=self._c["bg"])
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-        self._build_detail_panel(body, mode="skins")
 
         hdr = tk.Frame(left, bg=self._c["bg"])
         hdr.pack(fill=tk.X, pady=(0, 6))
@@ -5459,9 +5512,11 @@ class SkinTracker:
         visible = set()
         self._skin_row_names = {}
 
-        # Загружаем данные из базы с учетом фильтра
-        cursor = self.conn.cursor()
-        query = '''
+        # Filter the same database revision without allocating a fresh result set
+        # for every search keystroke. All writes use this connection.
+        revision = self.conn.total_changes
+        if revision != self._skin_rows_cache_key:
+            query = '''
             SELECT id, name, quantity, buy_price, total_buy_price,
                    buy_date, unlock_date, sell_date, sell_price, profit, profit_percent, with_sell_commission, sell_currency,
                    buy_price_usd, total_buy_price_usd, usd_rate_rub, target_sell_price_rub
@@ -5471,8 +5526,9 @@ class SkinTracker:
                      sell_date IS NULL DESC,
                      id ASC
         '''
-        cursor.execute(query)
-        all_data = cursor.fetchall()
+            self._skin_rows_cache = self.conn.execute(query).fetchall()
+            self._skin_rows_cache_key = revision
+        all_data = self._skin_rows_cache
 
         # Применяем фильтр по статусу, категории и поиску по названию
         status_filter = self.status_filter_var.get()
@@ -5485,11 +5541,11 @@ class SkinTracker:
             "Агенты": "agent",
             "Музыка": "music",
         }
-        needle = self._search_text(self.name_search_var).lower()
-        order_sell_profit_filter = getattr(self, "order_sell_profit_filter_var", tk.StringVar(value="Все")).get()
+        needle = self._search_text(self.name_search_var).casefold()
+        order_sell_profit_filter = self.order_sell_profit_filter_var.get()
         filtered_data = []
         for row in all_data:
-            if needle and needle not in (row[1] or "").lower():
+            if needle and needle not in (row[1] or "").casefold():
                 continue
             if cat_filter != "Все":
                 want = cat_map.get(cat_filter)
@@ -5545,6 +5601,7 @@ class SkinTracker:
                     row[13], row[14], row[15], row[16],
                 ))
 
+        previous_iid = None
         for index, row in enumerate(filtered_data):
             # Определяем статус
             status = self.get_skin_status(row[5], row[6], row[7])
@@ -5625,7 +5682,9 @@ class SkinTracker:
             stripe_tag = "row_odd" if index % 2 else "row_even"
             iid = f"skin:{row[0]}"
             visible.add(iid)
-            self._upsert_table_row(self.tree, iid, index, values=values, tags=(stripe_tag, status_tag))
+            self._upsert_table_row(self.tree, iid, index, values=values,
+                                   tags=(stripe_tag, status_tag), previous_iid=previous_iid)
+            previous_iid = iid
 
         removed = previous - visible
         if removed:
@@ -5650,203 +5709,20 @@ class SkinTracker:
             self._clear_skin_detail()
 
     @staticmethod
-    def _upsert_table_row(tree, iid, index, *, values, tags):
+    def _upsert_table_row(tree, iid, index, *, values, tags, previous_iid=None):
         if tree.exists(iid):
-            if tuple(map(str, tree.item(iid, "values"))) != tuple(map(str, values)):
+            if tree.item(iid, "values") != tuple(map(str, values)):
                 tree.item(iid, values=values)
-            tree.item(iid, tags=tags)
-            tree.move(iid, "", index)
+            if tree.item(iid, "tags") != tags:
+                tree.item(iid, tags=tags)
+            if tree.prev(iid) != (previous_iid or ""):
+                tree.move(iid, "", index)
         else:
             tree.insert("", index, iid=iid, values=values, tags=tags)
 
     def load_summary(self):
-        """Обновление KPI-карточек (ранее — текстовая статистика за период)."""
+        """Refresh the dashboard metrics."""
         self._compute_and_show_skins_kpis()
-        return
-        try:
-            start_date_raw = self.start_date_var.get()
-            end_date_raw = self.end_date_var.get()
-            start_iso = datetime.strptime(start_date_raw, "%d.%m.%Y").strftime("%Y-%m-%d")
-            end_iso = datetime.strptime(end_date_raw, "%d.%m.%Y").strftime("%Y-%m-%d")
-            now_iso = datetime.now().strftime("%Y-%m-%d")
-
-            scope_ids = self._current_scope_ids()
-            scope_note = " (по выделенным позициям)" if list(self.tree.selection()) else " (по текущему фильтру)"
-            id_filter_sql = ""
-            id_params = ()
-            if scope_ids:
-                placeholders = ",".join("?" for _ in scope_ids)
-                id_filter_sql = f" AND id IN ({placeholders})"
-                id_params = tuple(scope_ids)
-
-            cursor = self.conn.cursor()
-            # Общий профит за период (только проданные скины) - фильтруем по дате ПРОДАЖИ
-            cursor.execute(f"""
-                SELECT COALESCE(SUM(profit), 0) FROM skins
-                WHERE profit IS NOT NULL
-                AND sell_date IS NOT NULL
-                AND sell_date >= ? AND sell_date <= ?
-                {id_filter_sql}
-            """, (start_iso, end_iso, *id_params))
-            total_profit = cursor.fetchone()[0] or 0
-
-            # Общая сумма покупок за период - фильтруем по дате ПОКУПКИ
-            cursor.execute(f"""
-                SELECT SUM(total_buy_price) FROM skins
-                WHERE buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (start_iso, end_iso, *id_params))
-            total_spent = cursor.fetchone()[0] or 0
-
-            # Количество скинов ПРОДАННЫХ за период - фильтруем по дате ПРОДАЖИ
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM skins
-                WHERE sell_date IS NOT NULL
-                AND sell_date >= ? AND sell_date <= ?
-                {id_filter_sql}
-            """, (start_iso, end_iso, *id_params))
-            sold_count = cursor.fetchone()[0] or 0
-
-            # Количество скинов купленных, но НЕ проданных за период - фильтруем по дате ПОКУПКИ
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM skins
-                WHERE sell_date IS NULL
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (start_iso, end_iso, *id_params))
-            unsold_count = cursor.fetchone()[0] or 0
-
-            # Количество скинов купленных в период и ЖДУЩИХ разблокировки - фильтруем по дате ПОКУПКИ
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM skins
-                WHERE sell_date IS NULL
-                AND unlock_date > ?
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (now_iso, start_iso, end_iso, *id_params))
-            locked_count = cursor.fetchone()[0] or 0
-
-            # Количество скинов купленных в период и ДОСТУПНЫХ для продажи - фильтруем по дате ПОКУПКИ
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM skins
-                WHERE sell_date IS NULL
-                AND unlock_date <= ?
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (now_iso, start_iso, end_iso, *id_params))
-            available_count = cursor.fetchone()[0] or 0
-
-            # Сумма вложенных денег (доступные + ждущие) за период покупки
-            cursor.execute(f"""
-                SELECT SUM(total_buy_price) FROM skins
-                WHERE sell_date IS NULL
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (start_iso, end_iso, *id_params))
-            invested_money = cursor.fetchone()[0] or 0
-
-            # Сумма денег в ждущих разблокировки (купленных в период)
-            cursor.execute(f"""
-                SELECT SUM(total_buy_price) FROM skins
-                WHERE sell_date IS NULL
-                AND unlock_date > ?
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (now_iso, start_iso, end_iso, *id_params))
-            locked_money = cursor.fetchone()[0] or 0
-
-            # Сумма денег доступных для продажи (купленных в период)
-            cursor.execute(f"""
-                SELECT SUM(total_buy_price) FROM skins
-                WHERE sell_date IS NULL
-                AND unlock_date <= ?
-                AND buy_date >= ? AND buy_date <= ?
-                {id_filter_sql}
-            """, (now_iso, start_iso, end_iso, *id_params))
-            available_money = cursor.fetchone()[0] or 0
-
-            summary_text = f"📊 СТАТИСТИКА{scope_note} за период {start_date_raw} - {end_date_raw}:\n"
-
-            summary_text += f"Общий профит: {total_profit:.2f} руб.\n"
-
-            summary_text += f"Всего потрачено: {total_spent:.2f} руб.\n"
-
-            summary_text += f"Вложено сейчас: {invested_money:.2f} руб. (Ждут: {locked_money:.2f} руб. | Доступно: {available_money:.2f} руб.)\n"
-
-            summary_text += f"Продано скинов: {sold_count} | В наличии: {unsold_count}\n"
-
-            summary_text += f"Ждут разблокировки: {locked_count} | Доступны для продажи: {available_count}"
-
-            # Блок оценки инвентаря после подгрузки цен
-            if getattr(self, "sell_order_prices", None) or getattr(self, "buy_order_prices", None):
-                cursor.execute(f"""
-                    SELECT id, name, quantity, total_buy_price
-                    FROM skins
-                    WHERE sell_date IS NULL
-                      {id_filter_sql}
-                """, (*id_params,))
-                rows = cursor.fetchall()
-
-                inv_sell_rub = 0.0
-                inv_buyorder_rub = 0.0
-                inv_buy_rub = 0.0
-                priced_sell_cnt = 0
-                priced_buy_cnt = 0
-                for _id, name, qty, total_buy in rows:
-                    try:
-                        qty_i = int(qty or 0)
-                    except Exception:
-                        qty_i = 0
-                    inv_buy_rub += float(total_buy or 0)
-                    if qty_i > 0:
-                        sp = (getattr(self, "sell_order_prices", None) or {}).get(str(name), 0.0)
-                        if sp:
-                            inv_sell_rub += float(sp) * qty_i
-                            priced_sell_cnt += 1
-                        bp = (getattr(self, "buy_order_prices", None) or {}).get(str(name), 0.0)
-                        if bp:
-                            inv_buyorder_rub += float(bp) * qty_i
-                            priced_buy_cnt += 1
-
-                rate = None
-                try:
-                    rate, _src = self.fetch_usd_rub_rate()
-                    self._usd_rub_rate_cache = rate
-                except Exception:
-                    rate = self._usd_rub_rate_cache
-
-                def _fmt_block(title, gross_rub, priced_cnt):
-                    fee = MARKET_COMMISSION_RATE
-                    net_rub = gross_rub * (1.0 - fee)
-                    prof_gross_rub = gross_rub - inv_buy_rub
-                    prof_net_rub = net_rub - inv_buy_rub
-
-                    lines = [f"\n\n💰 {title}:\n"]
-                    if rate:
-                        lines.append(f"Оценка gross: {gross_rub / rate:.2f} $ (курс {rate:.4f} ₽/$)  ·  {gross_rub:.2f} ₽\n")
-                        lines.append(f"Оценка net (-10%): {net_rub / rate:.2f} $  ·  {net_rub:.2f} ₽\n")
-                        lines.append(
-                            "Профит gross/net: "
-                            f"{prof_gross_rub:+.2f} ₽ / {prof_gross_rub / rate:+.2f} $"
-                            f"  ·  {prof_net_rub:+.2f} ₽ / {prof_net_rub / rate:+.2f} $\n"
-                        )
-                    else:
-                        lines.append(f"Оценка gross: {gross_rub:.2f} ₽ (курс USD/RUB не получен)\n")
-                        lines.append(f"Оценка net (-10%): {net_rub:.2f} ₽\n")
-                        lines.append(f"Профит gross/net: {prof_gross_rub:+.2f} ₽  ·  {prof_net_rub:+.2f} ₽\n")
-                    lines.append(f"Цены найдены для {priced_cnt}/{len(rows)} позиций")
-                    return "".join(lines)
-
-                if getattr(self, "sell_order_prices", None):
-                    summary_text += _fmt_block("Если продать сейчас (sell orders)", inv_sell_rub, priced_sell_cnt)
-                if getattr(self, "buy_order_prices", None):
-                    summary_text += _fmt_block("Если слить в buy orders", inv_buyorder_rub, priced_buy_cnt)
-
-            self.summary_label.config(text=summary_text, fg=self._c['info'])
-        except ValueError:
-            self.summary_label.config(text="Ошибка: введите корректные даты (дд.мм.гггг)", fg=self._c['warn'])
-        except Exception as e:
-            self.summary_label.config(text=f"Ошибка при загрузке статистики: {str(e)}", fg=self._c['warn'])
 
 if __name__ == "__main__":
     import argparse
